@@ -50,8 +50,15 @@ use ssd1306::{I2CDisplayInterface, Ssd1306, prelude::*};
 const WIFI_NETWORK: &str = "SSID";
 const WIFI_PASSWORD: &str = "PASSWORD";
 
-// NTP server (time.google.com)
-const NTP_SERVER: (u8, u8, u8, u8) = (216, 239, 35, 0);
+// NTP servers to try (in order)
+// pool.ntp.org: 162.159.200.1, time.cloudflare.com: 162.159.200.123
+// time.google.com: 216.239.35.0, time.apple.com: 17.253.34.123
+const NTP_SERVERS: [(u8, u8, u8, u8); 4] = [
+    (162, 159, 200, 1), // pool.ntp.org (Cloudflare)
+    (129, 6, 15, 28),   // time.nist.gov (US NIST)
+    (216, 239, 35, 0),  // time.google.com
+    (17, 253, 34, 123), // time.apple.com
+];
 const NTP_PORT: u16 = 123;
 
 // Tehran timezone offset: UTC+3:30 = 3 hours and 30 minutes = 12600 seconds
@@ -76,53 +83,88 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
     runner.run().await
 }
 
-/// Simple NTP request - returns Unix timestamp
+/// Simple NTP request - tries multiple servers, returns Unix timestamp
 async fn get_ntp_time(stack: Stack<'static>) -> Result<u64, ()> {
-    // Create UDP socket for NTP
-    let mut rx_meta = [PacketMetadata::EMPTY; 1];
-    let mut rx_buffer = [0u8; 256];
-    let mut tx_meta = [PacketMetadata::EMPTY; 1];
-    let mut tx_buffer = [0u8; 256];
-
-    let mut socket = UdpSocket::new(
-        stack,
-        &mut rx_meta,
-        &mut rx_buffer,
-        &mut tx_meta,
-        &mut tx_buffer,
-    );
-
-    // Bind to any local port
-    socket.bind(0).map_err(|_| ())?;
-
-    // NTP packet (48 bytes)
-    let mut packet = [0u8; 48];
-    packet[0] = 0x1B; // LI=0, VN=3, Mode=3 (client)
-
-    let server = (
-        embassy_net::Ipv4Address::new(NTP_SERVER.0, NTP_SERVER.1, NTP_SERVER.2, NTP_SERVER.3),
-        NTP_PORT,
-    );
-
-    // Send request
-    socket.send_to(&packet, server).await.map_err(|_| ())?;
-
-    // Receive response with timeout (5 seconds)
-    let result = with_timeout(Duration::from_secs(5), socket.recv_from(&mut packet)).await;
-    let (len, _) = match result {
-        Ok(Ok(r)) => r,
-        _ => return Err(()),
-    };
-
-    if len >= 48 {
-        // Extract transmit timestamp (bytes 40-43 are seconds since 1900)
-        let secs = u32::from_be_bytes([packet[40], packet[41], packet[42], packet[43]]);
-        // Convert from NTP epoch (1900) to Unix epoch (1970)
-        // NTP epoch offset: 2208988800 seconds
-        Ok(secs.saturating_sub(2208988800) as u64)
-    } else {
-        Err(())
+    // Check if we have an IP address
+    if stack.config_v4().is_none() {
+        warn!("NTP: No IPv4 config yet");
+        return Err(());
     }
+
+    // Try each NTP server
+    for ntp_server in NTP_SERVERS.iter() {
+        // Create UDP socket for NTP
+        let mut rx_meta = [PacketMetadata::EMPTY; 1];
+        let mut rx_buffer = [0u8; 256];
+        let mut tx_meta = [PacketMetadata::EMPTY; 1];
+        let mut tx_buffer = [0u8; 256];
+
+        let mut socket = UdpSocket::new(
+            stack,
+            &mut rx_meta,
+            &mut rx_buffer,
+            &mut tx_meta,
+            &mut tx_buffer,
+        );
+
+        // Bind to any local port
+        if socket.bind(0).is_err() {
+            warn!("NTP: Failed to bind socket");
+            continue;
+        }
+
+        // NTP packet (48 bytes)
+        let mut packet = [0u8; 48];
+        packet[0] = 0x1B; // LI=0, VN=3, Mode=3 (client)
+
+        let server = (
+            embassy_net::Ipv4Address::new(ntp_server.0, ntp_server.1, ntp_server.2, ntp_server.3),
+            NTP_PORT,
+        );
+
+        info!(
+            "NTP: Trying {}.{}.{}.{}:{}",
+            ntp_server.0, ntp_server.1, ntp_server.2, ntp_server.3, NTP_PORT
+        );
+
+        // Send request
+        if socket.send_to(&packet, server).await.is_err() {
+            warn!("NTP: Failed to send packet");
+            continue;
+        }
+
+        // Receive response with timeout (3 seconds per server)
+        let result = with_timeout(Duration::from_secs(3), socket.recv_from(&mut packet)).await;
+        let (len, _) = match result {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => {
+                warn!("NTP: Receive error");
+                continue;
+            }
+            Err(_) => {
+                warn!("NTP: Timeout");
+                continue;
+            }
+        };
+
+        if len >= 48 {
+            // Extract transmit timestamp (bytes 40-43 are seconds since 1900)
+            let secs = u32::from_be_bytes([packet[40], packet[41], packet[42], packet[43]]);
+            // Convert from NTP epoch (1900) to Unix epoch (1970)
+            // NTP epoch offset: 2208988800 seconds
+            info!(
+                "NTP: Success from {}.{}.{}.{}",
+                ntp_server.0, ntp_server.1, ntp_server.2, ntp_server.3
+            );
+            return Ok(secs.saturating_sub(2208988800) as u64);
+        } else {
+            warn!("NTP: Response too short");
+        }
+    }
+
+    // All servers failed
+    warn!("NTP: All servers failed");
+    Err(())
 }
 
 /// Convert Unix timestamp to Tehran local time (hours, minutes, seconds)
@@ -198,7 +240,11 @@ async fn main(spawner: Spawner) {
     // ========================================================================
     let sda = p.PIN_4;
     let scl = p.PIN_5;
-    let i2c = I2c::new_async(p.I2C0, scl, sda, Irqs, i2c::Config::default());
+
+    // Configure I2C at 400 kHz (same as previous rp235x-hal version)
+    let mut i2c_config = i2c::Config::default();
+    i2c_config.frequency = 400_000;
+    let i2c = I2c::new_async(p.I2C0, scl, sda, Irqs, i2c_config);
 
     // Wrap I2C in RefCell for sharing between devices
     let i2c_ref_cell = RefCell::new(i2c);
