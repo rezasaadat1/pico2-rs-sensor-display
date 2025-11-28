@@ -55,6 +55,9 @@ embedded-hal = "1.0.0"
 embedded-hal-bus = "0.2"
 embedded-hal-async = "1.0.0"
 
+# RTC
+ds323x = "0.7"
+
 [profile.release]
 lto = true
 opt-level = "s"
