@@ -1,0 +1,30 @@
+{
+	"name": "Pico2 Rust Dev",
+	"build": {
+		"dockerfile": "Dockerfile",
+		"cacheFrom": "ghcr.io/${localEnv:GITHUB_REPOSITORY_OWNER:local}/pico2-rs-sensor-display-devcontainer"
+	},
+	"features": {
+		"ghcr.io/devcontainers/features/common-utils:2": {
+			"installZsh": true,
+			"configureZshAsDefaultShell": true,
+			"installOhMyZsh": true,
+			"installOhMyZshConfig": true,
+			"upgradePackages": true,
+			"username": "vscode",
+			"userUid": "automatic",
+			"userGid": "automatic"
+		}
+	},
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"rust-lang.rust-analyzer",
+				"probe-rs.probe-rs-debugger",
+				"eamodio.gitlens"
+			]
+		}
+	},
+	"postCreateCommand": "./.devcontainer/postCreateCommand.sh",
+	"remoteUser": "vscode"
+}

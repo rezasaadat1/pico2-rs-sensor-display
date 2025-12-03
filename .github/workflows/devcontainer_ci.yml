@@ -1,0 +1,102 @@
+name: Dev Container CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags:
+      - "v*.*.*"
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}-devcontainer
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and run Dev Container
+        uses: devcontainers/ci@v0.3
+        with:
+          imageName: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          cacheFrom: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          push: ${{ github.event_name != 'pull_request' && 'filter' || 'never' }}
+          refFilterForPush: refs/heads/main
+          runCmd: |
+            echo "=== Rust Environment ==="
+            rustc --version
+            cargo --version
+            rustup show
+            
+            echo "=== Running Cargo Check ==="
+            cargo check --release
+            
+            echo "=== Running Cargo Clippy ==="
+            cargo clippy --release -- -D warnings || true
+            
+            echo "=== Building Release ==="
+            cargo build --release
+            
+            echo "=== Build Artifacts ==="
+            ls -la target/thumbv8m.main-none-eabihf/release/
+            
+            # Copy the ELF binary to workspace root for artifact upload
+            cp target/thumbv8m.main-none-eabihf/release/pico2-rs-sensor-display ./pico2-rs-sensor-display.elf
+            
+            # Convert ELF to UF2 format for easy drag-and-drop flashing
+            echo "=== Converting to UF2 ==="
+            elf2uf2-rs target/thumbv8m.main-none-eabihf/release/pico2-rs-sensor-display ./pico2-rs-sensor-display.uf2
+            ls -la *.elf *.uf2
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pico2-firmware
+          path: |
+            pico2-rs-sensor-display.elf
+            pico2-rs-sensor-display.uf2
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pico2-firmware
+
+      - name: Upload ELF to GH release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ github.ref }}
+          file: pico2-rs-sensor-display.elf
+          asset_name: pico2-rs-sensor-display_${{ github.ref_name }}.elf
+          prerelease: false
+
+      - name: Upload UF2 to GH release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ github.ref }}
+          file: pico2-rs-sensor-display.uf2
+          asset_name: pico2-rs-sensor-display_${{ github.ref_name }}.uf2
+          prerelease: false
